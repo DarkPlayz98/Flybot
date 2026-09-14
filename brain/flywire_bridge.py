@@ -64,12 +64,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "service": "flybrain",
                 "device": DEVICE,
                 "motorNeuronPool": int(PROB_IDX.numel()) if PROB_IDX is not None else 0,
+                "queuedMessages": len(JOBS),
             })
             return
         self._json_response(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path != "/brain/process":
+        if self.path not in ("/brain/process", "/stimulus"):
             self._json_response(404, {"error": "Not found"})
             return
 
@@ -83,7 +84,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 raise ValueError("Request body too large")
             body = self.rfile.read(length).decode("utf-8", "replace")
             payload = json.loads(body or "{}")
-            text = str(payload.get("message", "")).strip()
+            text = str(payload.get("message", payload.get("text", ""))).strip()
             if not text:
                 raise ValueError("message is required")
 
@@ -91,7 +92,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 JOBS.append(job)
 
-            timeout = max(1.0, float(env("MESSAGE_PROCESS_TIMEOUT", "30")))
+            timeout = max(1.0, float(env("MESSAGE_PROCESS_TIMEOUT", "45")))
             if not job.event.wait(timeout):
                 self._json_response(504, {"error": "FlyBrain processing timeout"})
                 return
@@ -113,7 +114,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def start_health_server() -> None:
     port = int(env("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"[FlyWire] health/API server listening on port {port}", flush=True)
+    print(f"[FlyWire] HTTP/API server listening on port {port}", flush=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
@@ -126,10 +127,10 @@ def post_json(url: str, secret: str, payload: dict) -> dict:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {secret}",
-            "User-Agent": "FlyBot-FlyWire-Bridge/0.4",
+            "User-Agent": "FlyBot-FlyWire-Bridge/0.5",
         },
     )
-    with urllib.request.urlopen(req, timeout=20) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         raw = response.read().decode("utf-8", "replace")
         try:
             return json.loads(raw)
@@ -168,13 +169,15 @@ def load_flybrain():
     SUGAR_STIM = SIMULATOR.input_vector(sugar.indices, float(env("STIM_AMP", "2.0")))
 
     STEPS = max(1, int(env("SIM_STEPS", "40")))
-    ON_STEPS = min(STEPS, max(0, int(env("ON_STEPS", "25"))))
+    ON_STEPS = min(STEPS, max(1, int(env("ON_STEPS", "25"))))
 
     print(f"[FlyWire] loaded {len(proboscis)} proboscis motor neurons on {DEVICE}", flush=True)
-    return connectome
 
 
 def run_simulation(stimulus: torch.Tensor | None) -> tuple[float, float, list[float]]:
+    if SIMULATOR is None or PROB_IDX is None:
+        raise RuntimeError("FlyBrain simulator is not loaded")
+
     SIMULATOR.pop.reset()
     rates: list[float] = []
     for step in range(STEPS):
@@ -183,41 +186,44 @@ def run_simulation(stimulus: torch.Tensor | None) -> tuple[float, float, list[fl
             rates.append(float(spikes[PROB_IDX].float().mean().item()))
         else:
             rates.append(0.0)
+
     peak = max(rates) if rates else 0.0
     mean = float(np.mean(rates)) if rates else 0.0
     return peak, mean, rates
 
 
 def message_stimulus(text: str) -> tuple[torch.Tensor, str, float]:
-    """Turn each realtime Discord message into a deterministic sensory stimulus.
-
-    This is deliberately not an LLM or a canned reply system. The text is
-    converted to a bounded stimulus intensity and injected into the real
-    sugar-receptor input population, then the connectome determines the motor
-    activity that is reported back to Discord.
-    """
+    """Create a deterministic sensory stimulus from the actual Discord text."""
     normalized = " ".join(text.split())
-    lower = normalized.lower()
+    if not normalized:
+        raise ValueError("message is empty")
 
-    # Base stimulus from actual message content: length, character entropy proxy,
-    # and repeated character patterns. The same message therefore produces the
-    # same external sensory drive while different messages produce different
-    # drive values.
+    lower = normalized.lower()
     unique = len(set(normalized))
     length_factor = min(len(normalized), 240) / 240.0
     diversity_factor = min(unique, 80) / 80.0
     punctuation_factor = min(sum(ch in "!?.,:;" for ch in normalized), 12) / 12.0
+    vowel_factor = min(sum(ch in "aeiou" for ch in lower), 40) / 40.0
+    digit_factor = min(sum(ch.isdigit() for ch in normalized), 10) / 10.0
 
-    semantic_boost = 0.0
+    # Every non-empty message gets a stimulus. This prevents arbitrary text such
+    # as "Ay bro?" from becoming a zero-input event while keeping the actual
+    # simulator responsible for the neural result.
+    factor = (
+        0.20
+        + 0.30 * length_factor
+        + 0.20 * diversity_factor
+        + 0.10 * punctuation_factor
+        + 0.15 * vowel_factor
+        + 0.05 * digit_factor
+    )
+
     if any(word in lower.split() for word in ("food", "feed", "sugar", "eat", "hungry")):
-        semantic_boost += 0.30
-    if any(word in lower.split() for word in ("hi", "hello", "hey")):
-        semantic_boost += 0.05
+        factor += 0.15
 
-    factor = 0.20 + 0.45 * length_factor + 0.25 * diversity_factor + 0.10 * punctuation_factor + semantic_boost
-    factor = float(max(0.15, min(1.0, factor)))
+    factor = float(max(0.20, min(1.0, factor)))
     stimulus = SUGAR_STIM * factor
-    description = f"text-derived sugar stimulus factor={factor:.3f}"
+    description = f"message-derived sensory stimulus; factor={factor:.3f}"
     return stimulus, description, factor
 
 
@@ -226,17 +232,15 @@ def process_message_job(job: MessageJob) -> None:
         stimulus, stimulus_name, factor = message_stimulus(job.text)
         peak, mean, rates = run_simulation(stimulus)
 
-        # Report the strongest actual motor readout. Feed is the current real
-        # circuit readout used by FlyBot; no fake inverse/idle signal is added.
-        signal_name = "feed" if peak > 0 else "none"
         job.result = {
             "ok": True,
             "message": job.text,
             "source": "FlyWire FAFB v783 + FlyBrain LIF",
             "anatomy": "proboscis motor neurons",
+            "status": "processed",
             "stimulus": stimulus_name,
             "stimulusFactor": factor,
-            "action": {"name": signal_name, "score": peak} if signal_name != "none" else None,
+            "action": {"name": "feed", "score": peak} if peak > 0 else None,
             "peakActivity": peak,
             "meanActivity": mean,
             "neural": {
@@ -249,9 +253,10 @@ def process_message_job(job: MessageJob) -> None:
             },
             "sampledRates": rates[:12],
         }
+
         print(
-            f"[FlyWire] message={job.text[:120]!r} stimulus={factor:.3f} "
-            f"feed_peak={peak:.4f} mean={mean:.4f}",
+            f"[FlyWire] MESSAGE {job.text!r} -> factor={factor:.3f} "
+            f"peak={peak:.4f} mean={mean:.4f}",
             flush=True,
         )
     except Exception as exc:
@@ -263,33 +268,17 @@ def process_message_job(job: MessageJob) -> None:
 
 
 def run_legacy_connectome_loop(base: str, secret: str) -> None:
-    steps = STEPS
-    on_steps = ON_STEPS
-    pulse_ms = max(100, int(env("PULSE_MS", "250")))
+    pulse_ms = max(250, int(env("PULSE_MS", "5000")))
     reconnect_ms = max(1000, int(env("RECONNECT_MS", "5000")))
     heartbeat_every = max(1, int(env("HEARTBEAT_EVERY", "1")))
-    self_ping_every = max(60, int(env("SELF_PING_EVERY", "600")))
-
-    heartbeat_url = f"{base}/brain/heartbeat"
-    input_url = f"{base}/brain/input"
-    health_url = env("SELF_PING_URL", "").rstrip("/") or None
     pulse = 0
     last_heartbeat = -1
-    last_self_ping = 0.0
 
     while True:
         try:
-            now = time.monotonic()
-
-            if health_url and now - last_self_ping >= self_ping_every:
-                try:
-                    with urllib.request.urlopen(health_url + "/health", timeout=10) as response:
-                        response.read()
-                except Exception as exc:
-                    print(f"[FlyWire] self-ping warning: {exc}", file=sys.stderr, flush=True)
-                last_self_ping = now
-
-            # Realtime Discord jobs take priority over the autonomous demo pulse.
+            # Realtime Discord jobs always have priority. The autonomous loop is
+            # only retained as a background heartbeat/demo and no longer races
+            # each user message through the same endpoint.
             with JOBS_LOCK:
                 job = JOBS.popleft() if JOBS else None
             if job is not None:
@@ -298,7 +287,7 @@ def run_legacy_connectome_loop(base: str, secret: str) -> None:
 
             if pulse == 0 or pulse - last_heartbeat >= heartbeat_every:
                 post_json(
-                    heartbeat_url,
+                    f"{base}/brain/heartbeat",
                     secret,
                     {
                         "source": "FlyWire FAFB v783 + FlyBrain LIF",
@@ -308,36 +297,8 @@ def run_legacy_connectome_loop(base: str, secret: str) -> None:
                 )
                 last_heartbeat = pulse
 
-            peak, mean, _ = run_simulation(SUGAR_STIM)
-            signals = {"feed": peak} if peak > 0 else {}
-
-            result = post_json(
-                input_url,
-                secret,
-                {
-                    "source": "FlyWire FAFB v783 + FlyBrain LIF",
-                    "anatomy": "proboscis motor neurons",
-                    "signals": signals,
-                    "neural": {
-                        "device": DEVICE,
-                        "pulse": pulse,
-                        "motorNeuronPool": int(PROB_IDX.numel()),
-                        "peakFractionFiring": peak,
-                        "meanFractionFiring": mean,
-                        "steps": steps,
-                        "stimulatedSteps": on_steps,
-                    },
-                },
-            )
-
-            print(
-                f"[FlyWire] pulse={pulse} feed_peak={peak:.4f} mean={mean:.4f} response={result}",
-                flush=True,
-            )
+            time.sleep(pulse_ms / 1000)
             pulse += 1
-            elapsed = time.monotonic() - now
-            time.sleep(max(0.01, pulse_ms / 1000 - elapsed))
-
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             print(f"[FlyWire] network error: {exc}", file=sys.stderr, flush=True)
             time.sleep(reconnect_ms / 1000)
