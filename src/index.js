@@ -9,12 +9,16 @@ const PORT = Number(env('PORT', '10000'));
 const MIN_SIGNAL = Number(env('MIN_SIGNAL', '0.05'));
 const COOLDOWN_MS = Number(env('ACTION_COOLDOWN_MS', '3000'));
 const BRAIN_TIMEOUT_MS = Number(env('BRAIN_TIMEOUT_MS', '30000'));
-const AUTO_DISCOVER_CHANNEL = env('AUTO_DISCOVER_CHANNEL', 'false').toLowerCase() === 'true';
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+// MessageContent is intentionally NOT requested: it is a privileged Discord intent
+// and is not needed to detect a message, identify its author, or reply to it.
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
+
 let lastSignal = null;
 let lastMessage = null;
 let messagesSent = 0;
@@ -95,19 +99,13 @@ async function replyToMessage(message) {
   if (message.author?.bot) return;
   if (message.channelId !== TARGET_CHANNEL_ID) return;
 
-  const text = message.content.trim();
-  if (!text) return;
-
-  const replies = [
-    '🪰 I detected your message and the connectome is responding.',
-    '🪰 Input received. My fruit-fly neural circuit is processing it.',
-    '🪰 I heard you. Neural activity registered.',
-    '🪰 Message received by FlyBrain.'
-  ];
-  const reply = replies[Math.floor(Math.random() * replies.length)];
+  // We do not need message.content. GuildMessages gives us the message event,
+  // author and channel, allowing a direct reply without the privileged intent.
+  const reply = '🪰 Message received. FlyBrain is listening.';
   await message.reply(reply);
   lastMessage = new Date().toISOString();
   messagesSent += 1;
+  console.log(`[Discord] replied to ${message.author.tag || message.author.id} in ${TARGET_CHANNEL_ID}`);
 }
 
 function readJson(req) {
@@ -190,7 +188,7 @@ client.once('ready', async () => {
   console.log(`Target channel: ${TARGET_CHANNEL_ID}`);
   try {
     const channel = await resolveChannel();
-    const testMessage = await channel.send('🪰 FlyBot test message — FlyBrain gateway is online and listening.');
+    const testMessage = await channel.send('🪰 FlyBot test message — online and listening for messages.');
     lastMessage = testMessage.createdAt.toISOString();
     messagesSent += 1;
     console.log(`[Discord] test message sent to #${channel.name} (${channel.id})`);
