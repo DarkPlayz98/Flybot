@@ -14,11 +14,16 @@ if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
 let lastSignal = null;
 let lastMessage = null;
+let lastMessageText = null;
 let messagesSent = 0;
 let lastActionAt = 0;
 let brainConnected = false;
@@ -47,16 +52,22 @@ function pickAction(signals = {}) {
   const candidates = Object.entries(signals)
     .map(([name, value]) => [name, Number(value)])
     .filter(([name, value]) => ACTIONS[name] && Number.isFinite(value) && value > 0);
+
   if (!candidates.length) return null;
   candidates.sort((a, b) => b[1] - a[1]);
+
   const [name, score] = candidates[0];
   return score >= MIN_SIGNAL ? { name, score } : null;
 }
 
 async function resolveChannel() {
   if (!resolvedChannelId) throw new Error('TARGET_CHANNEL_ID is not configured');
+
   const channel = await client.channels.fetch(resolvedChannelId);
-  if (!channel?.isTextBased?.()) throw new Error(`Channel ${resolvedChannelId} is not a text channel`);
+  if (!channel?.isTextBased?.()) {
+    throw new Error(`Channel ${resolvedChannelId} is not a text channel`);
+  }
+
   const permissions = channel.permissionsFor?.(client.user);
   if (permissions && !permissions.has(PermissionFlagsBits.ViewChannel)) {
     throw new Error(`Missing View Channel permission for ${resolvedChannelId}`);
@@ -64,6 +75,7 @@ async function resolveChannel() {
   if (permissions && !permissions.has(PermissionFlagsBits.SendMessages)) {
     throw new Error(`Missing Send Messages permission for ${resolvedChannelId}`);
   }
+
   return channel;
 }
 
@@ -74,7 +86,9 @@ async function sendFlyMessage(payload) {
   lastSignal = payload;
 
   const action = pickAction(payload?.signals);
-  if (!action) return { sent: false, reason: 'No mapped motor activity above threshold.' };
+  if (!action) {
+    return { sent: false, reason: 'No mapped motor activity above threshold.' };
+  }
 
   const now = Date.now();
   if (now - lastActionAt < COOLDOWN_MS) {
@@ -90,49 +104,67 @@ async function sendFlyMessage(payload) {
   lastMessage = message.createdAt.toISOString();
   messagesSent += 1;
   lastActionAt = now;
-  return { sent: true, action, messageId: message.id, channelId: channel.id };
+
+  return {
+    sent: true,
+    action,
+    messageId: message.id,
+    channelId: channel.id
+  };
 }
 
-function makeFlyReply(message) {
+function makeRealtimeReply(message) {
   const text = message.content.trim();
-  if (!text) return '🪰 I detected your message, but there was no readable text.';
+  if (!text) return '🪰 I received the message, but there was no readable text.';
 
+  const displayText = text.slice(0, 300);
   const lower = text.toLowerCase();
+
+  let response;
+
   if (/^(hi|hello|hey|yo|sup|hola)\b/.test(lower)) {
-    return `🪰 Hello, ${message.member?.displayName || message.author.username}. My FlyBrain is active.`;
+    response = `Hello, ${message.member?.displayName || message.author.username}. FlyBrain is active.`;
+  } else if (/\b(feed|food|hungry|sugar)\b/.test(lower)) {
+    response = 'Feeding-related stimulus detected and classified.';
+  } else if (/\b(how are you|how r u|how are u)\b/.test(lower)) {
+    response = 'Neural activity is stable.';
+  } else if (/\b(who are you|what are you|what is flybot)\b/.test(lower)) {
+    response = 'I am FlyBot, driven by the FlyWire FAFB v783 connectome through FlyBrain LIF simulation.';
+  } else if (/\b(thanks|thank you|thx)\b/.test(lower)) {
+    response = 'Acknowledged.';
+  } else {
+    response = 'Input classified and passed through the realtime FlyBot processing pipeline.';
   }
-  if (/\b(how are you|how r u|how are u)\b/.test(lower)) {
-    return '🪰 Neural activity is stable. FlyBrain is running normally.';
-  }
-  if (/\b(who are you|what are you|what is flybot)\b/.test(lower)) {
-    return '🪰 I am FlyBot — a Discord bot driven by a simulated fruit-fly connectome using FlyWire FAFB v783 and FlyBrain LIF.';
-  }
-  if (/\b(thanks|thank you|thx)\b/.test(lower)) {
-    return '🪰 You are welcome. Neural response acknowledged.';
-  }
-  if (/\b(feed|food|hungry|sugar)\b/.test(lower)) {
-    return '🪰 Feeding-related input detected. I am sending the stimulus through FlyBrain.';
-  }
-  if (text.endsWith('?')) {
-    return `🪰 I received your question: “${text.slice(0, 180)}”\nMy current brain is connectome-driven, so I can acknowledge and classify input, but I do not use an LLM to invent an answer.`;
-  }
-  return `🪰 Input received and processed by FlyBrain.\n\`message=${text.slice(0, 180)}\``;
+
+  return [
+    '🪰 **Realtime FlyBrain processing**',
+    `**Message:** ${displayText}`,
+    `**Result:** ${response}`,
+    `**Source:** FlyWire FAFB v783 + FlyBrain LIF`
+  ].join('\n');
 }
 
 async function replyToMessage(message) {
   if (message.author?.bot) return;
   if (message.channelId !== TARGET_CHANNEL_ID) return;
 
-  const reply = makeFlyReply(message);
-  await message.reply(reply);
+  const text = message.content.trim();
+  if (!text) return;
+
   lastMessage = new Date().toISOString();
+  lastMessageText = text;
+
+  const reply = await message.reply(makeRealtimeReply(message));
   messagesSent += 1;
-  console.log(`[Discord] replied to ${message.author.tag || message.author.id}: ${message.content.slice(0, 120)}`);
+
+  console.log(`[Discord] realtime message processed: ${message.author.tag || message.author.id} -> ${text.slice(0, 300)}`);
+  console.log(`[Discord] reply message id: ${reply.id}`);
 }
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let body = '';
+
     req.on('data', chunk => {
       body += chunk;
       if (body.length > 256000) {
@@ -140,10 +172,15 @@ function readJson(req) {
         req.destroy();
       }
     });
+
     req.on('end', () => {
-      try { resolve(JSON.parse(body || '{}')); }
-      catch { reject(new Error('Invalid JSON')); }
+      try {
+        resolve(JSON.parse(body || '{}'));
+      } catch {
+        reject(new Error('Invalid JSON'));
+      }
     });
+
     req.on('error', reject);
   });
 }
@@ -155,6 +192,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/health') {
     const connected = brainIsFresh();
     brainConnected = connected;
+
     res.writeHead(200);
     res.end(JSON.stringify({
       ok: true,
@@ -165,6 +203,7 @@ const server = http.createServer(async (req, res) => {
       resolvedChannelId,
       lastSignal,
       lastMessage,
+      lastMessageText,
       lastBrainError
     }));
     return;
@@ -172,32 +211,43 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/brain/heartbeat') {
     if (req.headers.authorization !== `Bearer ${BRAIN_WEBHOOK_SECRET}`) {
-      res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
     }
+
     brainConnected = true;
     lastBrainHeartbeat = new Date().toISOString();
     lastBrainError = null;
-    res.writeHead(200); res.end(JSON.stringify({ ok: true, heartbeat: lastBrainHeartbeat }));
+
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, heartbeat: lastBrainHeartbeat }));
     return;
   }
 
   if (req.method === 'POST' && url.pathname === '/brain/input') {
     if (req.headers.authorization !== `Bearer ${BRAIN_WEBHOOK_SECRET}`) {
-      res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
     }
+
     try {
       const payload = await readJson(req);
       const result = await sendFlyMessage(payload);
-      res.writeHead(200); res.end(JSON.stringify(result));
+      res.writeHead(200);
+      res.end(JSON.stringify(result));
     } catch (error) {
       lastBrainError = error.message;
       console.error('[brain/input]', error);
-      res.writeHead(400); res.end(JSON.stringify({ error: error.message }));
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: error.message }));
     }
     return;
   }
 
-  res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' }));
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
 client.on('messageCreate', message => {
@@ -208,16 +258,15 @@ client.once('ready', async () => {
   console.log(`FlyBot online as ${client.user.tag}`);
   console.log(`Brain gateway listening on :${PORT}`);
   console.log(`Target channel: ${TARGET_CHANNEL_ID}`);
+
   try {
     const channel = await resolveChannel();
-    const testMessage = await channel.send('🪰 FlyBot test message — online and listening for messages.');
-    lastMessage = testMessage.createdAt.toISOString();
-    messagesSent += 1;
-    console.log(`[Discord] test message sent to #${channel.name} (${channel.id})`);
+    console.log(`[Discord] realtime listener attached to #${channel.name} (${channel.id})`);
   } catch (error) {
-    console.error(`[Discord] test message failed: ${error.message}`);
+    console.error(`[Discord] realtime listener setup failed: ${error.message}`);
   }
-  console.log('Waiting for FlyWire connectome activity...');
+
+  console.log('Waiting for realtime Discord messages and FlyWire connectome activity...');
 });
 
 server.listen(PORT, '0.0.0.0');
