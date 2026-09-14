@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Live FlyWire FAFB connectome -> FlyBot bridge.
+"""Realtime FlyWire FAFB v783 -> FlyBrain LIF bridge.
 
-Runs the real FlyBrain simulator and exposes HTTP endpoints for health,
-connectome motor input, and realtime Discord-message processing.
+The service uses the real FlyWire-derived sparse connectome cache, but builds
+its Torch CSR runtime without creating an additional signed scipy matrix. This
+keeps the free Render instance below its 512 MiB memory ceiling.
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -19,7 +21,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import scipy.sparse as sp
 import torch
+
+# Keep BLAS/OpenMP thread overhead small on Render's tiny instance.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 def env(name: str, default: str = "") -> str:
@@ -39,9 +49,12 @@ JOBS_LOCK = threading.Lock()
 SIMULATOR = None
 DEVICE = "cpu"
 PROB_IDX = None
-SUGAR_STIM = None
+SUGAR_IDX = None
 STEPS = 40
 ON_STEPS = 25
+READY = False
+LOAD_ERROR = None
+LAST_MESSAGE = None
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -59,12 +72,16 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/health"):
-            self._json_response(200, {
-                "status": "ok",
+            self._json_response(200 if READY else 503, {
+                "status": "ok" if READY else "loading",
                 "service": "flybrain",
+                "ready": READY,
                 "device": DEVICE,
                 "motorNeuronPool": int(PROB_IDX.numel()) if PROB_IDX is not None else 0,
+                "sugarInputPool": int(SUGAR_IDX.numel()) if SUGAR_IDX is not None else 0,
                 "queuedMessages": len(JOBS),
+                "lastMessage": LAST_MESSAGE,
+                "loadError": LOAD_ERROR,
             })
             return
         self._json_response(404, {"error": "Not found"})
@@ -78,10 +95,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._json_response(401, {"error": "Unauthorized"})
             return
 
+        if not READY:
+            self._json_response(503, {"error": "FlyBrain is still loading", "loadError": LOAD_ERROR})
+            return
+
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length > 256000:
                 raise ValueError("Request body too large")
+
             body = self.rfile.read(length).decode("utf-8", "replace")
             payload = json.loads(body or "{}")
             text = str(payload.get("message", payload.get("text", ""))).strip()
@@ -111,7 +133,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_health_server() -> None:
+def start_http_server() -> None:
     port = int(env("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     print(f"[FlyWire] HTTP/API server listening on port {port}", flush=True)
@@ -127,7 +149,7 @@ def post_json(url: str, secret: str, payload: dict) -> dict:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {secret}",
-            "User-Agent": "FlyBot-FlyWire-Bridge/0.5",
+            "User-Agent": "FlyBot-FlyWire-Bridge/0.6",
         },
     )
     with urllib.request.urlopen(req, timeout=30) as response:
@@ -138,40 +160,143 @@ def post_json(url: str, secret: str, payload: dict) -> dict:
             return {"raw": raw}
 
 
-def load_flybrain():
-    global SIMULATOR, DEVICE, PROB_IDX, SUGAR_STIM, STEPS, ON_STEPS
+def build_runtime(root: Path):
+    """Load only the metadata needed for the named circuits and reuse the
+    cached sparse CSR arrays directly as Torch buffers.
 
-    root = Path(env("FLYBRAIN_PATH", "./vendor/flybrain")).resolve()
-    if not root.exists():
-        raise RuntimeError(f"FLYBRAIN_PATH does not exist: {root}")
+    The old implementation created:
+      1. unsigned scipy CSR
+      2. a second signed scipy CSR
+      3. a Torch CSR copy
 
-    sys.path.insert(0, str(root))
-    from flybrain.circuits import Circuits
-    from flybrain.loader import Connectome
-    from flybrain.simulator import Simulator
+    On a 512 MiB instance that startup peak was enough to cause Render 502s.
+    Here we mutate the cached CSR data to signed float32 in-place, build Torch
+    tensors from those same NumPy buffers, and immediately discard metadata.
+    """
+    global SIMULATOR, DEVICE, PROB_IDX, SUGAR_IDX, STEPS, ON_STEPS, READY, LOAD_ERROR
 
-    cache = Path(env("FLYBRAIN_CACHE", str(root / "outputs" / "connectome"))).resolve()
-    if not cache.exists():
-        raise RuntimeError(f"Connectome cache not found: {cache}")
+    try:
+        cache = Path(env("FLYBRAIN_CACHE", str(root / "outputs" / "connectome"))).resolve()
+        matrix_path = cache / "syn_counts.npz"
+        nodes_path = cache / "nodes.parquet"
 
-    DEVICE = env("FLYBRAIN_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-    connectome = Connectome.load(cache)
-    circuits = Circuits(connectome)
-    sugar = circuits.sugar_grns()
-    proboscis = circuits.proboscis_motor_neurons()
+        if not matrix_path.exists() or not nodes_path.exists():
+            raise RuntimeError(f"Connectome cache incomplete: {cache}")
 
-    SIMULATOR = Simulator.from_connectome(
-        connectome,
-        device=DEVICE,
-        weight_scale=float(env("WEIGHT_SCALE", "0.2")),
-    )
-    PROB_IDX = torch.as_tensor(proboscis.indices, dtype=torch.long, device=DEVICE)
-    SUGAR_STIM = SIMULATOR.input_vector(sugar.indices, float(env("STIM_AMP", "2.0")))
+        print(f"[FlyWire] loading sparse cache: {matrix_path}", flush=True)
+        syn_counts = sp.load_npz(matrix_path).tocsr()
+        print(
+            f"[FlyWire] sparse matrix loaded: shape={syn_counts.shape} nnz={syn_counts.nnz:,}",
+            flush=True,
+        )
 
-    STEPS = max(1, int(env("SIM_STEPS", "40")))
-    ON_STEPS = min(STEPS, max(1, int(env("ON_STEPS", "25"))))
+        # Read only columns needed to identify input/output populations and signs.
+        nodes = pd.read_parquet(
+            nodes_path,
+            columns=["root_id", "nt_sign", "class", "sub_class", "super_class"],
+        )
+        if len(nodes) != syn_counts.shape[0]:
+            raise RuntimeError(
+                f"Node/matrix size mismatch: nodes={len(nodes)} matrix={syn_counts.shape[0]}"
+            )
 
-    print(f"[FlyWire] loaded {len(proboscis)} proboscis motor neurons on {DEVICE}", flush=True)
+        node_root = nodes["root_id"].to_numpy(dtype=np.int64, copy=False)
+        nt_sign = nodes["nt_sign"].fillna(0).to_numpy(dtype=np.int8, copy=False)
+
+        sugar_mask = (
+            nodes["class"].astype("string").eq("gustatory")
+            & nodes["sub_class"].astype("string").eq("sugar/water")
+        ).fillna(False).to_numpy(dtype=bool)
+        prob_mask = (
+            nodes["super_class"].astype("string").eq("motor")
+            & nodes["sub_class"].astype("string").eq("proboscis_motor_neuron")
+        ).fillna(False).to_numpy(dtype=bool)
+
+        sugar_indices = np.flatnonzero(sugar_mask).astype(np.int64, copy=False)
+        prob_indices = np.flatnonzero(prob_mask).astype(np.int64, copy=False)
+
+        if sugar_indices.size == 0:
+            raise RuntimeError("No sugar/water gustatory receptor neurons found in cache")
+        if prob_indices.size == 0:
+            raise RuntimeError("No proboscis motor neurons found in cache")
+
+        print(
+            f"[FlyWire] circuits: sugar_input={sugar_indices.size} proboscis_motor={prob_indices.size}",
+            flush=True,
+        )
+
+        # Convert matrix values in-place to signed float32 weights.
+        # CSR indices point to the presynaptic column for every stored edge.
+        if syn_counts.data.dtype != np.float32:
+            syn_counts.data = syn_counts.data.astype(np.float32, copy=True)
+        syn_counts.data *= nt_sign[syn_counts.indices].astype(np.float32, copy=False)
+        syn_counts.eliminate_zeros()
+        scale = float(env("WEIGHT_SCALE", "0.2"))
+        syn_counts.data *= scale
+
+        # Release pandas metadata before constructing the live simulator.
+        del nodes, node_root, nt_sign, sugar_mask, prob_mask
+        gc.collect()
+
+        DEVICE = "cpu"  # Render free instances have no CUDA device.
+
+        # Reuse the NumPy CSR buffers for the Torch CSR when possible.
+        crow = torch.from_numpy(syn_counts.indptr)
+        col = torch.from_numpy(syn_counts.indices)
+        val = torch.from_numpy(syn_counts.data)
+        weight_tensor = torch.sparse_csr_tensor(
+            crow,
+            col,
+            val,
+            size=syn_counts.shape,
+            device=DEVICE,
+            dtype=torch.float32,
+            check_invariants=False,
+        )
+
+        # Import the real FlyBrain LIF implementation, but avoid
+        # Simulator.from_connectome() because that method constructs another
+        # scipy signed matrix first.
+        sys.path.insert(0, str(root))
+        from flybrain.neurons import LIFPopulation
+        from flybrain.simulator import Simulator
+
+        simulator = Simulator.__new__(Simulator)
+        simulator.device = torch.device(DEVICE)
+        simulator.dtype = torch.float32
+        simulator.weight_scale = 1.0
+        simulator.W = weight_tensor
+        simulator.n = int(weight_tensor.shape[0])
+        simulator.pop = LIFPopulation(simulator.n, device=DEVICE, dtype=torch.float32)
+
+        SIMULATOR = simulator
+        SUGAR_IDX = torch.from_numpy(sugar_indices)
+        PROB_IDX = torch.from_numpy(prob_indices)
+
+        STEPS = max(1, int(env("SIM_STEPS", "40")))
+        ON_STEPS = min(STEPS, max(1, int(env("ON_STEPS", "25"))))
+
+        # Build the external sugar stimulus once. This is only a dense 139K
+        # vector, tiny compared with the sparse connectivity.
+        sugar_stim = torch.zeros(simulator.n, dtype=torch.float32, device=DEVICE)
+        sugar_stim[SUGAR_IDX] = float(env("STIM_AMP", "2.0"))
+        globals()["SUGAR_STIM"] = sugar_stim
+
+        READY = True
+        LOAD_ERROR = None
+        print(
+            f"[FlyWire] REAL connectome runtime ready: {simulator.n:,} neurons, "
+            f"{weight_tensor._nnz():,} signed edges, CPU LIF, weight_scale={scale}",
+            flush=True,
+        )
+    except Exception as exc:
+        LOAD_ERROR = str(exc)
+        READY = False
+        print(f"[FlyWire] runtime load error: {exc}", file=sys.stderr, flush=True)
+        raise
+
+
+SUGAR_STIM = None
 
 
 def run_simulation(stimulus: torch.Tensor | None) -> tuple[float, float, list[float]]:
@@ -180,12 +305,13 @@ def run_simulation(stimulus: torch.Tensor | None) -> tuple[float, float, list[fl
 
     SIMULATOR.pop.reset()
     rates: list[float] = []
-    for step in range(STEPS):
-        spikes = SIMULATOR.step(stimulus if step < ON_STEPS else None)
-        if PROB_IDX.numel():
-            rates.append(float(spikes[PROB_IDX].float().mean().item()))
-        else:
-            rates.append(0.0)
+    with torch.no_grad():
+        for step in range(STEPS):
+            spikes = SIMULATOR.step(stimulus if step < ON_STEPS else None)
+            if PROB_IDX.numel():
+                rates.append(float(spikes[PROB_IDX].float().mean().item()))
+            else:
+                rates.append(0.0)
 
     peak = max(rates) if rates else 0.0
     mean = float(np.mean(rates)) if rates else 0.0
@@ -193,7 +319,7 @@ def run_simulation(stimulus: torch.Tensor | None) -> tuple[float, float, list[fl
 
 
 def message_stimulus(text: str) -> tuple[torch.Tensor, str, float]:
-    """Create a deterministic sensory stimulus from the actual Discord text."""
+    """Convert the actual Discord text into a sensory input to the real LIF network."""
     normalized = " ".join(text.split())
     if not normalized:
         raise ValueError("message is empty")
@@ -206,9 +332,6 @@ def message_stimulus(text: str) -> tuple[torch.Tensor, str, float]:
     vowel_factor = min(sum(ch in "aeiou" for ch in lower), 40) / 40.0
     digit_factor = min(sum(ch.isdigit() for ch in normalized), 10) / 10.0
 
-    # Every non-empty message gets a stimulus. This prevents arbitrary text such
-    # as "Ay bro?" from becoming a zero-input event while keeping the actual
-    # simulator responsible for the neural result.
     factor = (
         0.20
         + 0.30 * length_factor
@@ -228,10 +351,12 @@ def message_stimulus(text: str) -> tuple[torch.Tensor, str, float]:
 
 
 def process_message_job(job: MessageJob) -> None:
+    global LAST_MESSAGE
     try:
         stimulus, stimulus_name, factor = message_stimulus(job.text)
         peak, mean, rates = run_simulation(stimulus)
 
+        LAST_MESSAGE = job.text
         job.result = {
             "ok": True,
             "message": job.text,
@@ -245,7 +370,9 @@ def process_message_job(job: MessageJob) -> None:
             "meanActivity": mean,
             "neural": {
                 "device": DEVICE,
+                "neurons": int(SIMULATOR.n),
                 "motorNeuronPool": int(PROB_IDX.numel()),
+                "sugarInputPool": int(SUGAR_IDX.numel()),
                 "peakFractionFiring": peak,
                 "meanFractionFiring": mean,
                 "steps": STEPS,
@@ -255,7 +382,7 @@ def process_message_job(job: MessageJob) -> None:
         }
 
         print(
-            f"[FlyWire] MESSAGE {job.text!r} -> factor={factor:.3f} "
+            f"[FlyWire] MESSAGE {job.text!r} -> stimulus={factor:.3f} "
             f"peak={peak:.4f} mean={mean:.4f}",
             flush=True,
         )
@@ -267,60 +394,56 @@ def process_message_job(job: MessageJob) -> None:
             job.event.set()
 
 
-def run_legacy_connectome_loop(base: str, secret: str) -> None:
-    pulse_ms = max(250, int(env("PULSE_MS", "5000")))
-    reconnect_ms = max(1000, int(env("RECONNECT_MS", "5000")))
-    heartbeat_every = max(1, int(env("HEARTBEAT_EVERY", "1")))
-    pulse = 0
-    last_heartbeat = -1
+def worker_loop() -> None:
+    base = env("FLYBOT_URL").rstrip("/")
+    secret = env("BRAIN_WEBHOOK_SECRET")
+    heartbeat_interval = max(10.0, float(env("HEARTBEAT_INTERVAL", "30")))
+    next_heartbeat = 0.0
 
     while True:
         try:
-            # Realtime Discord jobs always have priority. The autonomous loop is
-            # only retained as a background heartbeat/demo and no longer races
-            # each user message through the same endpoint.
             with JOBS_LOCK:
                 job = JOBS.popleft() if JOBS else None
+
             if job is not None:
                 process_message_job(job)
                 continue
 
-            if pulse == 0 or pulse - last_heartbeat >= heartbeat_every:
-                post_json(
-                    f"{base}/brain/heartbeat",
-                    secret,
-                    {
-                        "source": "FlyWire FAFB v783 + FlyBrain LIF",
-                        "pulse": pulse,
-                        "device": DEVICE,
-                    },
-                )
-                last_heartbeat = pulse
+            now = time.monotonic()
+            if base and secret and now >= next_heartbeat:
+                try:
+                    post_json(
+                        f"{base}/brain/heartbeat",
+                        secret,
+                        {"source": "FlyWire FAFB v783 + FlyBrain LIF", "device": DEVICE},
+                    )
+                except Exception as exc:
+                    print(f"[FlyWire] heartbeat warning: {exc}", file=sys.stderr, flush=True)
+                next_heartbeat = now + heartbeat_interval
 
-            time.sleep(pulse_ms / 1000)
-            pulse += 1
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            print(f"[FlyWire] network error: {exc}", file=sys.stderr, flush=True)
-            time.sleep(reconnect_ms / 1000)
-        except KeyboardInterrupt:
-            print("[FlyWire] stopped", flush=True)
-            return
+            time.sleep(0.05)
         except Exception as exc:
-            print(f"[FlyWire] loop error: {exc}", file=sys.stderr, flush=True)
-            time.sleep(reconnect_ms / 1000)
+            print(f"[FlyWire] worker error: {exc}", file=sys.stderr, flush=True)
+            time.sleep(1.0)
 
 
 def main() -> None:
-    start_health_server()
+    # Start HTTP immediately so Render sees an open port while the connectome loads.
+    start_http_server()
 
-    base = env("FLYBOT_URL").rstrip("/")
-    secret = env("BRAIN_WEBHOOK_SECRET")
-    if not base or not secret:
-        raise RuntimeError("FLYBOT_URL and BRAIN_WEBHOOK_SECRET are required")
+    root = Path(env("FLYBRAIN_PATH", "./vendor/flybrain")).resolve()
+    if not root.exists():
+        raise RuntimeError(f"FLYBRAIN_PATH does not exist: {root}")
 
-    load_flybrain()
-    print("[FlyWire] realtime Discord-message processing is enabled", flush=True)
-    run_legacy_connectome_loop(base, secret)
+    print("[FlyWire] starting memory-optimized REAL FAFB v783 runtime", flush=True)
+    build_runtime(root)
+
+    thread = threading.Thread(target=worker_loop, daemon=True)
+    thread.start()
+
+    print("[FlyWire] realtime Discord-message processing is ENABLED", flush=True)
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
