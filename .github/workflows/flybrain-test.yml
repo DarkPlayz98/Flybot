@@ -91,12 +91,13 @@ jobs:
             --repo "$FLYWIRE_RELEASE_REPO" \
             --json tagName,name,assets
 
+          # GitHub's web uploader renamed the uploaded .csv.gz files to
+          # .csv.gz.csv. Download those actual release asset names, then
+          # restore the filenames expected by FlyBrain.
+          echo "Downloading release assets with the uploader-added .csv suffix..."
           gh release download "$FLYWIRE_RELEASE_TAG" \
             --repo "$FLYWIRE_RELEASE_REPO" \
-            --pattern "neurons.csv.gz" \
-            --pattern "classification.csv.gz" \
-            --pattern "consolidated_cell_types.csv.gz" \
-            --pattern "connections_princeton.csv.gz" \
+            --pattern "*.csv.gz.csv" \
             --dir data \
             --clobber
 
@@ -107,10 +108,27 @@ jobs:
             "connections_princeton.csv.gz"
           )
 
+          echo ""
+          echo "Normalizing release asset filenames..."
+          for file in "${required[@]}"; do
+            uploaded="data/${file}.csv"
+            target="data/$file"
+
+            if [ ! -s "$uploaded" ]; then
+              echo "ERROR: Missing release asset $uploaded"
+              echo "Expected release asset: ${file}.csv"
+              exit 1
+            fi
+
+            mv -f "$uploaded" "$target"
+            echo "Renamed: $(basename "$uploaded") -> $(basename "$target")"
+          done
+
+          echo ""
+          echo "Validating gzip files..."
           for file in "${required[@]}"; do
             if [ ! -s "data/$file" ]; then
-              echo "ERROR: Missing release asset data/$file"
-              echo "Upload this exact file to release $FLYWIRE_RELEASE_TAG."
+              echo "ERROR: Missing normalized file data/$file"
               exit 1
             fi
             gzip -t "data/$file"
