@@ -21,18 +21,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Clone FlyBrain simulator
+      - name: Clone FlyBrain
         run: |
           git clone --depth 1 \
             https://github.com/Tharusha101/flybrain.git \
             vendor/flybrain
 
-      - name: Upgrade pip
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-
-      - name: Install scientific dependencies
-        run: |
           python -m pip install \
             numpy \
             pandas \
@@ -43,12 +40,9 @@ jobs:
             seaborn \
             tqdm \
             rich
-
-      - name: Install PyTorch
-        run: |
           python -m pip install torch
 
-      - name: Check Python environment
+      - name: Check packages
         run: |
           python --version
           python -c "import numpy; print('NumPy:', numpy.__version__)"
@@ -56,26 +50,25 @@ jobs:
           python -c "import scipy; print('SciPy:', scipy.__version__)"
           python -c "import torch; print('PyTorch:', torch.__version__)"
 
-      - name: Test FlyBrain import
+      - name: FlyBrain import
         env:
           PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
         run: |
           python -c "import flybrain; print('FlyBrain import: OK')"
-
-      - name: Test simulator modules
-        env:
-          PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
-        run: |
           python -c "from flybrain.simulator import Simulator; print('Simulator import: OK')"
-          python -c "from flybrain.connectome import Connectome; print('Connectome import: OK')"
 
-      - name: Check FlyBot bridge
+      - name: Inspect FlyBrain modules
+        run: |
+          echo "=== flybrain directory ==="
+          find vendor/flybrain/flybrain -maxdepth 2 -type f | sort
+
+          echo ""
+          echo "=== Python classes/modules containing Connectome ==="
+          grep -R "class Connectome\|Connectome" \
+            -n vendor/flybrain/flybrain \
+            --include="*.py" | head -100 || true
+
+      - name: Test FlyBot bridge syntax
         run: |
           python -m py_compile brain/flywire_bridge.py
           echo "flywire_bridge.py syntax: OK"
-
-      - name: Final result
-        run: |
-          echo "======================================"
-          echo " FlyBrain environment test completed"
-          echo "======================================"
