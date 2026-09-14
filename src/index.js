@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, PermissionFlagsBits } from 'discord.js';
 
 const env = (key, fallback = '') => process.env[key] ?? fallback;
 const DISCORD_TOKEN = env('DISCORD_TOKEN');
@@ -9,9 +9,9 @@ const PORT = Number(env('PORT', '8080'));
 const MIN_SIGNAL = Number(env('MIN_SIGNAL', '0.05'));
 const COOLDOWN_MS = Number(env('ACTION_COOLDOWN_MS', '3000'));
 const BRAIN_TIMEOUT_MS = Number(env('BRAIN_TIMEOUT_MS', '30000'));
+const AUTO_DISCOVER_CHANNEL = env('AUTO_DISCOVER_CHANNEL', 'true').toLowerCase() !== 'false';
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
-if (!TARGET_CHANNEL_ID) throw new Error('TARGET_CHANNEL_ID is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -22,6 +22,7 @@ let lastActionAt = 0;
 let brainConnected = false;
 let lastBrainHeartbeat = null;
 let lastBrainError = null;
+let resolvedChannelId = TARGET_CHANNEL_ID || null;
 
 const ACTIONS = {
   forward: '🪰 I am moving forward.',
@@ -52,6 +53,58 @@ function pickAction(signals = {}) {
   return score >= MIN_SIGNAL ? { name, score } : null;
 }
 
+async function resolveChannel() {
+  if (resolvedChannelId) {
+    try {
+      const channel = await client.channels.fetch(resolvedChannelId);
+      if (channel?.isTextBased()) {
+        const permissions = channel.permissionsFor?.(client.user);
+        if (!permissions || permissions.has(PermissionFlagsBits.SendMessages)) return channel;
+      }
+    } catch (error) {
+      console.warn(`[Discord] configured channel unavailable: ${error.message}`);
+    }
+  }
+
+  if (!AUTO_DISCOVER_CHANNEL) {
+    throw new Error('TARGET_CHANNEL_ID is unavailable or not writable');
+  }
+
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const channels = await guild.channels.fetch();
+      const candidates = [...channels.values()]
+        .filter(channel => channel?.isTextBased?.())
+        .filter(channel => {
+          const permissions = channel.permissionsFor?.(client.user);
+          return !permissions || permissions.has(PermissionFlagsBits.SendMessages);
+        })
+        .sort((a, b) => {
+          const aName = String(a.name || '').toLowerCase();
+          const bName = String(b.name || '').toLowerCase();
+          const score = name => {
+            if (name.includes('flybot')) return 0;
+            if (name.includes('bot')) return 1;
+            if (name.includes('ai')) return 2;
+            if (name.includes('chat')) return 3;
+            return 4;
+          };
+          return score(aName) - score(bName);
+        });
+
+      if (candidates.length) {
+        resolvedChannelId = candidates[0].id;
+        console.log(`[Discord] auto-selected #${candidates[0].name} (${resolvedChannelId}) in ${guild.name}`);
+        return candidates[0];
+      }
+    } catch (error) {
+      console.warn(`[Discord] could not inspect ${guild.name}: ${error.message}`);
+    }
+  }
+
+  throw new Error('No writable Discord text channel was found');
+}
+
 async function sendFlyMessage(payload) {
   brainConnected = true;
   lastBrainHeartbeat = new Date().toISOString();
@@ -66,9 +119,7 @@ async function sendFlyMessage(payload) {
     return { sent: false, reason: 'Action cooldown active.', action };
   }
 
-  const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
-  if (!channel?.isTextBased()) throw new Error('TARGET_CHANNEL_ID is not a text channel');
-
+  const channel = await resolveChannel();
   const anatomy = payload?.anatomy ? `\n\`readout=${payload.anatomy}\`` : '';
   const source = payload?.source ? `\n\`source=${payload.source}\`` : '';
   const content = `${ACTIONS[action.name]}\n\`signal=${action.name}\` \`activity=${action.score.toFixed(4)}\`${anatomy}${source}`;
@@ -77,7 +128,7 @@ async function sendFlyMessage(payload) {
   lastMessage = message.createdAt.toISOString();
   messagesSent += 1;
   lastActionAt = now;
-  return { sent: true, action, messageId: message.id };
+  return { sent: true, action, messageId: message.id, channelId: channel.id };
 }
 
 function readJson(req) {
@@ -116,6 +167,7 @@ const server = http.createServer(async (req, res) => {
       lastBrainHeartbeat,
       brainTimeoutMs: BRAIN_TIMEOUT_MS,
       messagesSent,
+      resolvedChannelId,
       lastSignal,
       lastMessage,
       lastBrainError
@@ -133,6 +185,7 @@ const server = http.createServer(async (req, res) => {
       minSignal: MIN_SIGNAL,
       cooldownMs: COOLDOWN_MS,
       timeoutMs: BRAIN_TIMEOUT_MS,
+      resolvedChannelId,
       lastSignal,
       lastBrainError
     }));
@@ -182,6 +235,7 @@ const server = http.createServer(async (req, res) => {
 client.once('ready', () => {
   console.log(`FlyBot online as ${client.user.tag}`);
   console.log(`Brain gateway listening on :${PORT}`);
+  console.log(`Target channel: ${TARGET_CHANNEL_ID || 'auto-discovery enabled'}`);
   console.log('Waiting for FlyWire connectome activity...');
 });
 
