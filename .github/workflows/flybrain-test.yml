@@ -1,4 +1,4 @@
-name: FlyBrain + FlyBot Test
+name: FlyBrain + FlyBot Real Connectome
 
 on:
   workflow_dispatch:
@@ -9,9 +9,10 @@ on:
       - "package.json"
 
 jobs:
-  flybrain-test:
-    name: Test FlyBrain Environment
+  flybrain-real-connectome:
+    name: Download + Build + Simulate Real FlyWire Connectome
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout FlyBot
@@ -28,12 +29,9 @@ jobs:
             https://github.com/Tharusha101/flybrain.git \
             vendor/flybrain
 
-      - name: Upgrade pip
-        run: |
-          python -m pip install --upgrade pip
-
       - name: Install scientific dependencies
         run: |
+          python -m pip install --upgrade pip
           python -m pip install \
             numpy \
             pandas \
@@ -44,9 +42,6 @@ jobs:
             seaborn \
             tqdm \
             rich
-
-      - name: Install PyTorch
-        run: |
           python -m pip install torch
 
       - name: Show environment
@@ -54,163 +49,123 @@ jobs:
           echo "======================================"
           echo " FlyBot / FlyBrain Environment"
           echo "======================================"
-
           python --version
           echo "Architecture: $(uname -m)"
-
-          echo ""
-          echo "NumPy:"
-          python -c "import numpy; print(numpy.__version__)"
-
-          echo "Pandas:"
-          python -c "import pandas; print(pandas.__version__)"
-
-          echo "SciPy:"
-          python -c "import scipy; print(scipy.__version__)"
-
-          echo "PyArrow:"
-          python -c "import pyarrow; print(pyarrow.__version__)"
-
-          echo "NetworkX:"
-          python -c "import networkx; print(networkx.__version__)"
-
-          echo "PyTorch:"
-          python -c "import torch; print(torch.__version__)"
-
-          echo "CUDA available:"
-          python -c "import torch; print(torch.cuda.is_available())"
+          python -c "import numpy; print('NumPy:', numpy.__version__)"
+          python -c "import pandas; print('Pandas:', pandas.__version__)"
+          python -c "import scipy; print('SciPy:', scipy.__version__)"
+          python -c "import pyarrow; print('PyArrow:', pyarrow.__version__)"
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
       - name: Test FlyBrain package
         env:
           PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
         run: |
-          echo "Testing FlyBrain..."
+          python -c "import flybrain; print('FlyBrain import: OK')"
+          python -c "from flybrain.simulator import Simulator; print('Simulator import: OK')"
 
-          python -c \
-            "import flybrain; print('FlyBrain import: OK')"
-
-          python -c \
-            "from flybrain.simulator import Simulator; print('Simulator import: OK')"
-
-      - name: Inspect FlyBrain source
+      - name: Download real FlyWire FAFB v783 data
+        working-directory: vendor/flybrain
         run: |
-          echo "======================================"
-          echo " FlyBrain Source Structure"
-          echo "======================================"
+          set -euo pipefail
 
-          find vendor/flybrain/flybrain \
-            -maxdepth 2 \
-            -type f \
-            | sort
+          mkdir -p data
 
-      - name: Find connectome implementation
-        run: |
-          echo "======================================"
-          echo " Connectome Implementation"
-          echo "======================================"
+          BASE="https://codex.flywire.ai/api/download_resource"
+          DATASET="fafb"
 
-          grep -RniE \
-            "class Connectome|Connectome|from_connectome|load_connectome" \
-            vendor/flybrain/flybrain \
-            --include="*.py" \
-            | head -200 || true
-
-      - name: Inspect data requirements
-        run: |
-          echo "======================================"
-          echo " Data Requirements"
-          echo "======================================"
-
-          for FILE in \
-            vendor/flybrain/README.md \
-            vendor/flybrain/SIMULATOR_GUIDE.md \
-            vendor/flybrain/README.txt
-          do
-            if [ -f "$FILE" ]; then
-              echo ""
-              echo "----- $FILE -----"
-
-              grep -niE \
-                "download|connectome|parquet|cache|Codex|data|FlyWire" \
-                "$FILE" \
-                | head -150 || true
-            fi
-          done
-
-      - name: Find connectome data
-        run: |
-          echo "======================================"
-          echo " Existing Connectome Data"
-          echo "======================================"
-
-          FOUND=0
-
-          while IFS= read -r FILE; do
-            echo "$FILE"
-            FOUND=1
-          done < <(
-            find vendor/flybrain \
-              -type f \
-              \( \
-                -iname "*.parquet" \
-                -o -iname "*.npz" \
-                -o -iname "*.npy" \
-                -o -iname "*.csv" \
-              \) \
-              | head -200
-          )
-
-          if [ "$FOUND" -eq 0 ]; then
+          download() {
+            PRODUCT="$1"
+            FILE="$2"
             echo ""
-            echo "No connectome dataset found."
-            echo "This is expected: the FlyWire dataset is not bundled."
-          fi
+            echo "Downloading $FILE from Codex product: $PRODUCT"
+            curl --fail --location --retry 4 --retry-delay 5 \
+              --connect-timeout 30 --max-time 1200 \
+              -A "FlyBot-FlyWire-Research/1.0" \
+              "${BASE}?data_product=${PRODUCT}&dataset=${DATASET}" \
+              -o "data/${FILE}"
+            gzip -t "data/${FILE}"
+            ls -lh "data/${FILE}"
+          }
 
-      - name: Test FlyBot bridge syntax
+          download "neurons" "neurons.csv.gz"
+          download "classification" "classification.csv.gz"
+          download "consolidated_cell_types" "consolidated_cell_types.csv.gz"
+          download "connections_princeton" "connections_princeton.csv.gz"
+
+          echo ""
+          echo "Real FlyWire source files downloaded successfully."
+          ls -lh data/*.csv.gz
+
+      - name: Verify FlyWire data schema
+        working-directory: vendor/flybrain
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
+        run: |
+          python scripts/inspect_data.py
+
+      - name: Build sparse real connectome
+        working-directory: vendor/flybrain
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
+        run: |
+          python scripts/build_graph.py
+
+          echo ""
+          echo "======================================"
+          echo " Built Connectome Cache"
+          echo "======================================"
+          find outputs/connectome -maxdepth 2 -type f -printf '%p %k KB\n' | sort
+
+      - name: Run real sugar-to-proboscis simulation
+        working-directory: vendor/flybrain
         env:
           PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
         run: |
           echo "======================================"
-          echo " FlyBot Bridge"
+          echo " REAL FLYWIRE LIF SIMULATION"
           echo "======================================"
+          python scripts/simulate_taste.py
 
+      - name: Verify FlyBot bridge
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
+        run: |
           python -m py_compile brain/flywire_bridge.py
-
           echo "flywire_bridge.py syntax: OK"
 
-      - name: Verify project files
-        run: |
-          echo "======================================"
-          echo " FlyBot Project"
-          echo "======================================"
-
-          test -f package.json
-          test -f src/index.js
-          test -f brain/flywire_bridge.py
-
-          echo "package.json: OK"
-          echo "src/index.js: OK"
-          echo "brain/flywire_bridge.py: OK"
+      - name: Upload real simulation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flybrain-real-results
+          path: |
+            vendor/flybrain/outputs/**
+            vendor/flybrain/assets/*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Final report
+        if: always()
         run: |
           echo ""
           echo "=============================================="
-          echo "          FLYBOT FLYBRAIN TEST"
+          echo "       FLYBOT REAL CONNECTOME TEST"
           echo "=============================================="
           echo ""
-          echo "Python environment       : PASS"
-          echo "Scientific dependencies  : PASS"
-          echo "PyTorch                  : PASS"
-          echo "FlyBrain package         : PASS"
-          echo "FlyBrain simulator       : PASS"
-          echo "FlyBot bridge syntax     : PASS"
+          echo "This workflow attempted the actual public FlyWire FAFB dataset."
+          echo "It is NOT a synthetic brain test."
           echo ""
-          echo "Connectome data:"
-          echo "The actual FlyWire dataset is not bundled"
-          echo "with the FlyBrain repository."
+          echo "Pipeline:"
+          echo "  1. FlyWire CSV download"
+          echo "  2. Data schema verification"
+          echo "  3. Sparse 139k-neuron connectome build"
+          echo "  4. LIF neural simulation"
+          echo "  5. Sugar -> proboscis motor readout"
+          echo "  6. FlyBot bridge verification"
           echo ""
-          echo "NEXT:"
-          echo "Connect the actual FlyWire dataset."
+          echo "If the run passed, the next step is connecting the"
+          echo "simulated motor output to the live FlyBot Discord bot."
           echo ""
           echo "=============================================="
