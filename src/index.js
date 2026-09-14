@@ -8,6 +8,7 @@ const BRAIN_WEBHOOK_SECRET = env('BRAIN_WEBHOOK_SECRET');
 const PORT = Number(env('PORT', '8080'));
 const MIN_SIGNAL = Number(env('MIN_SIGNAL', '0.05'));
 const COOLDOWN_MS = Number(env('ACTION_COOLDOWN_MS', '3000'));
+const BRAIN_TIMEOUT_MS = Number(env('BRAIN_TIMEOUT_MS', '30000'));
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!TARGET_CHANNEL_ID) throw new Error('TARGET_CHANNEL_ID is required');
@@ -20,6 +21,7 @@ let messagesSent = 0;
 let lastActionAt = 0;
 let brainConnected = false;
 let lastBrainHeartbeat = null;
+let lastBrainError = null;
 
 const ACTIONS = {
   forward: '🪰 I am moving forward.',
@@ -33,10 +35,15 @@ const ACTIONS = {
   idle: '🪰 Neural activity returned to baseline.'
 };
 
+function brainIsFresh() {
+  if (!lastBrainHeartbeat) return false;
+  return Date.now() - new Date(lastBrainHeartbeat).getTime() <= BRAIN_TIMEOUT_MS;
+}
+
 function pickAction(signals = {}) {
   const candidates = Object.entries(signals)
     .map(([name, value]) => [name, Number(value)])
-    .filter(([name, value]) => ACTIONS[name] && Number.isFinite(value));
+    .filter(([name, value]) => ACTIONS[name] && Number.isFinite(value) && value > 0);
 
   if (!candidates.length) return null;
   candidates.sort((a, b) => b[1] - a[1]);
@@ -48,6 +55,7 @@ function pickAction(signals = {}) {
 async function sendFlyMessage(payload) {
   brainConnected = true;
   lastBrainHeartbeat = new Date().toISOString();
+  lastBrainError = null;
   lastSignal = payload;
 
   const action = pickAction(payload?.signals);
@@ -98,27 +106,35 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
 
   if (req.method === 'GET' && url.pathname === '/health') {
+    const connected = brainIsFresh();
+    brainConnected = connected;
     res.writeHead(200);
     res.end(JSON.stringify({
       ok: true,
       discordReady: client.isReady(),
-      brainConnected,
+      brainConnected: connected,
       lastBrainHeartbeat,
+      brainTimeoutMs: BRAIN_TIMEOUT_MS,
       messagesSent,
       lastSignal,
-      lastMessage
+      lastMessage,
+      lastBrainError
     }));
     return;
   }
 
   if (req.method === 'GET' && url.pathname === '/brain/status') {
+    const connected = brainIsFresh();
+    brainConnected = connected;
     res.writeHead(200);
     res.end(JSON.stringify({
-      connected: brainConnected,
+      connected,
       lastHeartbeat: lastBrainHeartbeat,
       minSignal: MIN_SIGNAL,
       cooldownMs: COOLDOWN_MS,
-      lastSignal
+      timeoutMs: BRAIN_TIMEOUT_MS,
+      lastSignal,
+      lastBrainError
     }));
     return;
   }
@@ -132,6 +148,7 @@ const server = http.createServer(async (req, res) => {
 
     brainConnected = true;
     lastBrainHeartbeat = new Date().toISOString();
+    lastBrainError = null;
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, heartbeat: lastBrainHeartbeat }));
     return;
@@ -150,6 +167,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200);
       res.end(JSON.stringify(result));
     } catch (error) {
+      lastBrainError = error.message;
       console.error('[brain/input]', error);
       res.writeHead(400);
       res.end(JSON.stringify({ error: error.message }));
