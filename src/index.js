@@ -9,8 +9,9 @@ const PORT = Number(env('PORT', '10000'));
 const MIN_SIGNAL = Number(env('MIN_SIGNAL', '0.05'));
 const COOLDOWN_MS = Number(env('ACTION_COOLDOWN_MS', '3000'));
 const BRAIN_TIMEOUT_MS = Number(env('BRAIN_TIMEOUT_MS', '30000'));
-const BRAIN_PROCESS_TIMEOUT_MS = Number(env('BRAIN_PROCESS_TIMEOUT_MS', '30000'));
+const BRAIN_PROCESS_TIMEOUT_MS = Number(env('BRAIN_PROCESS_TIMEOUT_MS', '60000'));
 const BRAIN_PROCESS_URL = env('BRAIN_PROCESS_URL', 'https://flybot-brain.onrender.com/brain/process');
+const BRAIN_RETRIES = Math.max(1, Number(env('BRAIN_RETRIES', '3')));
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
@@ -88,40 +89,61 @@ function timeoutSignal(ms) {
   return { controller, timer };
 }
 
+function cleanError(raw, status) {
+  const text = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!text) return `FlyBrain HTTP ${status}`;
+  if (text.includes('502') || status === 502) return 'FlyBrain service is temporarily unavailable (Render 502).';
+  if (text.includes('503') || status === 503) return 'FlyBrain service is temporarily unavailable (Render 503).';
+  if (text.includes('504') || status === 504) return 'FlyBrain processing timed out.';
+  if (text.includes('501') || status === 501) return 'FlyBrain endpoint does not support POST on the current deployment.';
+  return text.slice(0, 800);
+}
+
 async function processThroughFlyBrain(text, author) {
-  const { controller, timer } = timeoutSignal(BRAIN_PROCESS_TIMEOUT_MS);
-  try {
-    const response = await fetch(BRAIN_PROCESS_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${BRAIN_WEBHOOK_SECRET}`
-      },
-      body: JSON.stringify({
-        message: text,
-        author: author?.username || 'unknown',
-        timestamp: new Date().toISOString(),
-        source: 'Discord realtime message'
-      })
-    });
+  let lastError = null;
 
-    const raw = await response.text();
-    let payload;
+  for (let attempt = 1; attempt <= BRAIN_RETRIES; attempt += 1) {
+    const { controller, timer } = timeoutSignal(BRAIN_PROCESS_TIMEOUT_MS);
     try {
-      payload = JSON.parse(raw || '{}');
-    } catch {
-      payload = { error: raw || 'Invalid FlyBrain response' };
-    }
+      const response = await fetch(BRAIN_PROCESS_URL, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${BRAIN_WEBHOOK_SECRET}`
+        },
+        body: JSON.stringify({
+          message: text,
+          author: author?.username || 'unknown',
+          timestamp: new Date().toISOString(),
+          source: 'Discord realtime message'
+        })
+      });
 
-    if (!response.ok) {
-      throw new Error(payload.error || `FlyBrain HTTP ${response.status}`);
-    }
+      const raw = await response.text();
+      let payload;
+      try {
+        payload = JSON.parse(raw || '{}');
+      } catch {
+        payload = { error: cleanError(raw, response.status) };
+      }
 
-    return payload;
-  } finally {
-    clearTimeout(timer);
+      if (!response.ok) {
+        throw new Error(cleanError(payload.error || raw, response.status));
+      }
+
+      return payload;
+    } catch (error) {
+      lastError = error;
+      if (attempt < BRAIN_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
+
+  throw lastError || new Error('FlyBrain processing failed');
 }
 
 async function sendFlyMessage(payload) {
@@ -183,6 +205,16 @@ function formatBrainReply(input, result) {
   return lines.join('\n');
 }
 
+async function safeReply(message, content) {
+  const text = String(content || '🪰 FlyBrain returned no result.');
+  if (text.length <= 1900) {
+    return message.reply(text);
+  }
+
+  const first = text.slice(0, 1850);
+  return message.reply(`${first}\n…`);
+}
+
 async function replyToMessage(message) {
   if (message.author?.bot) return;
   if (message.channelId !== TARGET_CHANNEL_ID) return;
@@ -203,13 +235,14 @@ async function replyToMessage(message) {
   } catch (error) {
     lastBrainError = error.message;
     console.error(`[FlyBrain] realtime processing failed: ${error.message}`);
-    await message.reply(
+    await safeReply(
+      message,
       `🪰 **FlyBrain realtime processing**\n**Message:** ${text.slice(0, 500)}\n**Status:** processing failed\n**Error:** ${error.message}`
     );
     return;
   }
 
-  const reply = await message.reply(formatBrainReply(text, result));
+  const reply = await safeReply(message, formatBrainReply(text, result));
   messagesSent += 1;
 
   console.log(`[Discord] realtime message processed: ${message.author.tag || message.author.id} -> ${text.slice(0, 300)}`);
