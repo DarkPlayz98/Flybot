@@ -13,10 +13,8 @@ const BRAIN_TIMEOUT_MS = Number(env('BRAIN_TIMEOUT_MS', '30000'));
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
 
-// MessageContent is intentionally NOT requested: it is a privileged Discord intent
-// and is not needed to detect a message, identify its author, or reply to it.
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 let lastSignal = null;
@@ -95,17 +93,41 @@ async function sendFlyMessage(payload) {
   return { sent: true, action, messageId: message.id, channelId: channel.id };
 }
 
+function makeFlyReply(message) {
+  const text = message.content.trim();
+  if (!text) return '🪰 I detected your message, but there was no readable text.';
+
+  const lower = text.toLowerCase();
+  if (/^(hi|hello|hey|yo|sup|hola)\b/.test(lower)) {
+    return `🪰 Hello, ${message.member?.displayName || message.author.username}. My FlyBrain is active.`;
+  }
+  if (/\b(how are you|how r u|how are u)\b/.test(lower)) {
+    return '🪰 Neural activity is stable. FlyBrain is running normally.';
+  }
+  if (/\b(who are you|what are you|what is flybot)\b/.test(lower)) {
+    return '🪰 I am FlyBot — a Discord bot driven by a simulated fruit-fly connectome using FlyWire FAFB v783 and FlyBrain LIF.';
+  }
+  if (/\b(thanks|thank you|thx)\b/.test(lower)) {
+    return '🪰 You are welcome. Neural response acknowledged.';
+  }
+  if (/\b(feed|food|hungry|sugar)\b/.test(lower)) {
+    return '🪰 Feeding-related input detected. I am sending the stimulus through FlyBrain.';
+  }
+  if (text.endsWith('?')) {
+    return `🪰 I received your question: “${text.slice(0, 180)}”\nMy current brain is connectome-driven, so I can acknowledge and classify input, but I do not use an LLM to invent an answer.`;
+  }
+  return `🪰 Input received and processed by FlyBrain.\n\`message=${text.slice(0, 180)}\``;
+}
+
 async function replyToMessage(message) {
   if (message.author?.bot) return;
   if (message.channelId !== TARGET_CHANNEL_ID) return;
 
-  // We do not need message.content. GuildMessages gives us the message event,
-  // author and channel, allowing a direct reply without the privileged intent.
-  const reply = '🪰 Message received. FlyBrain is listening.';
+  const reply = makeFlyReply(message);
   await message.reply(reply);
   lastMessage = new Date().toISOString();
   messagesSent += 1;
-  console.log(`[Discord] replied to ${message.author.tag || message.author.id} in ${TARGET_CHANNEL_ID}`);
+  console.log(`[Discord] replied to ${message.author.tag || message.author.id}: ${message.content.slice(0, 120)}`);
 }
 
 function readJson(req) {
