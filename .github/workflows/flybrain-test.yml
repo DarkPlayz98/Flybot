@@ -8,11 +8,17 @@ on:
       - ".github/workflows/flybrain-test.yml"
       - "package.json"
 
+env:
+  FLYWIRE_RELEASE_REPO: DarkPlayz98/Flybot
+  FLYWIRE_RELEASE_TAG: flywire-fafb-v783
+
 jobs:
   flybrain-real-connectome:
     name: Download + Build + Simulate Real FlyWire Connectome
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout FlyBot
@@ -65,37 +71,54 @@ jobs:
           python -c "import flybrain; print('FlyBrain import: OK')"
           python -c "from flybrain.simulator import Simulator; print('Simulator import: OK')"
 
-      - name: Download real FlyWire FAFB v783 data
+      - name: Download FlyWire data from GitHub Release
         working-directory: vendor/flybrain
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           mkdir -p data
 
-          BASE="https://codex.flywire.ai/api/download_resource"
-          DATASET="fafb"
+          echo "=============================================="
+          echo " Downloading FlyWire FAFB data from Release"
+          echo "=============================================="
+          echo "Repository: $FLYWIRE_RELEASE_REPO"
+          echo "Release:    $FLYWIRE_RELEASE_TAG"
+          echo ""
 
-          download() {
-            PRODUCT="$1"
-            FILE="$2"
-            echo ""
-            echo "Downloading $FILE from Codex product: $PRODUCT"
-            curl --fail --location --retry 4 --retry-delay 5 \
-              --connect-timeout 30 --max-time 1200 \
-              -A "FlyBot-FlyWire-Research/1.0" \
-              "${BASE}?data_product=${PRODUCT}&dataset=${DATASET}" \
-              -o "data/${FILE}"
-            gzip -t "data/${FILE}"
-            ls -lh "data/${FILE}"
-          }
+          gh release view "$FLYWIRE_RELEASE_TAG" \
+            --repo "$FLYWIRE_RELEASE_REPO" \
+            --json tagName,name,assets
 
-          download "neurons" "neurons.csv.gz"
-          download "classification" "classification.csv.gz"
-          download "consolidated_cell_types" "consolidated_cell_types.csv.gz"
-          download "connections_princeton" "connections_princeton.csv.gz"
+          gh release download "$FLYWIRE_RELEASE_TAG" \
+            --repo "$FLYWIRE_RELEASE_REPO" \
+            --pattern "neurons.csv.gz" \
+            --pattern "classification.csv.gz" \
+            --pattern "consolidated_cell_types.csv.gz" \
+            --pattern "connections_princeton.csv.gz" \
+            --dir data \
+            --clobber
+
+          required=(
+            "neurons.csv.gz"
+            "classification.csv.gz"
+            "consolidated_cell_types.csv.gz"
+            "connections_princeton.csv.gz"
+          )
+
+          for file in "${required[@]}"; do
+            if [ ! -s "data/$file" ]; then
+              echo "ERROR: Missing release asset data/$file"
+              echo "Upload this exact file to release $FLYWIRE_RELEASE_TAG."
+              exit 1
+            fi
+            gzip -t "data/$file"
+            echo "Verified: data/$file ($(du -h "data/$file" | cut -f1))"
+          done
 
           echo ""
-          echo "Real FlyWire source files downloaded successfully."
+          echo "All required FlyWire source files are available."
           ls -lh data/*.csv.gz
 
       - name: Verify FlyWire data schema
@@ -154,18 +177,18 @@ jobs:
           echo "       FLYBOT REAL CONNECTOME TEST"
           echo "=============================================="
           echo ""
-          echo "This workflow attempted the actual public FlyWire FAFB dataset."
-          echo "It is NOT a synthetic brain test."
+          echo "Data source: GitHub Release $FLYWIRE_RELEASE_TAG"
+          echo "Repository:  $FLYWIRE_RELEASE_REPO"
           echo ""
           echo "Pipeline:"
-          echo "  1. FlyWire CSV download"
+          echo "  1. FlyWire FAFB source files from release assets"
           echo "  2. Data schema verification"
           echo "  3. Sparse 139k-neuron connectome build"
           echo "  4. LIF neural simulation"
           echo "  5. Sugar -> proboscis motor readout"
           echo "  6. FlyBot bridge verification"
           echo ""
-          echo "If the run passed, the next step is connecting the"
-          echo "simulated motor output to the live FlyBot Discord bot."
+          echo "The source CSV files are NOT committed to git."
+          echo "They are consumed as release assets at runtime."
           echo ""
           echo "=============================================="
