@@ -18,10 +18,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Clone FlyBrain
         run: |
@@ -56,12 +55,8 @@ jobs:
           echo " FlyBot / FlyBrain Environment"
           echo "======================================"
 
-          echo "Python:"
           python --version
-
-          echo ""
-          echo "Architecture:"
-          uname -m
+          echo "Architecture: $(uname -m)"
 
           echo ""
           echo "NumPy:"
@@ -91,7 +86,8 @@ jobs:
         run: |
           echo "Testing FlyBrain..."
 
-          python -c "import flybrain; print('FlyBrain import: OK')"
+          python -c \
+            "import flybrain; print('FlyBrain import: OK')"
 
           python -c \
             "from flybrain.simulator import Simulator; print('Simulator import: OK')"
@@ -133,6 +129,7 @@ jobs:
             if [ -f "$FILE" ]; then
               echo ""
               echo "----- $FILE -----"
+
               grep -niE \
                 "download|connectome|parquet|cache|Codex|data|FlyWire" \
                 "$FILE" \
@@ -164,6 +161,7 @@ jobs:
           )
 
           if [ "$FOUND" -eq 0 ]; then
+            echo ""
             echo "No connectome dataset found."
             echo "This is expected: the FlyWire dataset is not bundled."
           fi
@@ -179,17 +177,6 @@ jobs:
           python -m py_compile brain/flywire_bridge.py
 
           echo "flywire_bridge.py syntax: OK"
-
-      - name: Inspect FlyBot bridge
-        run: |
-          echo "======================================"
-          echo " Bridge Configuration"
-          echo "======================================"
-
-          grep -nE \
-            "FLYBOT_URL|BRAIN_WEBHOOK_SECRET|FLYBRAIN_PATH|FLYBRAIN_CACHE|FLYBRAIN_DEVICE|WEIGHT_SCALE|STIM_AMP|PULSE_MS" \
-            brain/flywire_bridge.py \
-            | head -100 || true
 
       - name: Verify project files
         run: |
@@ -220,11 +207,10 @@ jobs:
           echo "FlyBot bridge syntax     : PASS"
           echo ""
           echo "Connectome data:"
-          echo "The actual FlyWire dataset is NOT bundled"
+          echo "The actual FlyWire dataset is not bundled"
           echo "with the FlyBrain repository."
           echo ""
           echo "NEXT:"
-          echo "Connect the actual FlyWire dataset and run"
-          echo "the neural simulation."
+          echo "Connect the actual FlyWire dataset."
           echo ""
           echo "=============================================="
