@@ -9,6 +9,8 @@ const PORT = Number(env('PORT', '10000'));
 const MIN_SIGNAL = Number(env('MIN_SIGNAL', '0.05'));
 const COOLDOWN_MS = Number(env('ACTION_COOLDOWN_MS', '3000'));
 const BRAIN_TIMEOUT_MS = Number(env('BRAIN_TIMEOUT_MS', '30000'));
+const BRAIN_PROCESS_TIMEOUT_MS = Number(env('BRAIN_PROCESS_TIMEOUT_MS', '30000'));
+const BRAIN_PROCESS_URL = env('BRAIN_PROCESS_URL', 'https://flybot-brain.onrender.com/brain/process');
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
@@ -24,6 +26,7 @@ const client = new Client({
 let lastSignal = null;
 let lastMessage = null;
 let lastMessageText = null;
+let lastNeuralResult = null;
 let messagesSent = 0;
 let lastActionAt = 0;
 let brainConnected = false;
@@ -32,15 +35,15 @@ let lastBrainError = null;
 let resolvedChannelId = TARGET_CHANNEL_ID;
 
 const ACTIONS = {
-  forward: '🪰 I am moving forward.',
-  left: '🪰 I turned left.',
-  right: '🪰 I turned right.',
-  backward: '🪰 I moved backward.',
-  escape: '🪰 Escape response detected!',
-  groom: '🪰 Grooming response detected.',
-  explore: '🪰 I am exploring.',
-  feed: '🪰 Feeding response detected.',
-  idle: '🪰 Neural activity returned to baseline.'
+  forward: '🪰 forward',
+  left: '🪰 left',
+  right: '🪰 right',
+  backward: '🪰 backward',
+  escape: '🪰 escape',
+  groom: '🪰 groom',
+  explore: '🪰 explore',
+  feed: '🪰 feed',
+  idle: '🪰 idle'
 };
 
 function brainIsFresh() {
@@ -79,6 +82,48 @@ async function resolveChannel() {
   return channel;
 }
 
+function timeoutSignal(ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { controller, timer };
+}
+
+async function processThroughFlyBrain(text, author) {
+  const { controller, timer } = timeoutSignal(BRAIN_PROCESS_TIMEOUT_MS);
+  try {
+    const response = await fetch(BRAIN_PROCESS_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${BRAIN_WEBHOOK_SECRET}`
+      },
+      body: JSON.stringify({
+        message: text,
+        author: author?.username || 'unknown',
+        timestamp: new Date().toISOString(),
+        source: 'Discord realtime message'
+      })
+    });
+
+    const raw = await response.text();
+    let payload;
+    try {
+      payload = JSON.parse(raw || '{}');
+    } catch {
+      payload = { error: raw || 'Invalid FlyBrain response' };
+    }
+
+    if (!response.ok) {
+      throw new Error(payload.error || `FlyBrain HTTP ${response.status}`);
+    }
+
+    return payload;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function sendFlyMessage(payload) {
   brainConnected = true;
   lastBrainHeartbeat = new Date().toISOString();
@@ -113,35 +158,29 @@ async function sendFlyMessage(payload) {
   };
 }
 
-function makeRealtimeReply(message) {
-  const text = message.content.trim();
-  if (!text) return '🪰 I received the message, but there was no readable text.';
+function formatBrainReply(input, result) {
+  const message = String(input || '').trim().slice(0, 500);
+  const action = result?.action?.name || result?.signal?.name || 'none';
+  const activity = Number(result?.action?.score ?? result?.activity ?? 0);
+  const anatomy = result?.anatomy || 'neural population';
+  const mean = Number(result?.neural?.meanFractionFiring ?? result?.meanActivity ?? 0);
+  const peak = Number(result?.neural?.peakFractionFiring ?? result?.peakActivity ?? activity);
 
-  const displayText = text.slice(0, 300);
-  const lower = text.toLowerCase();
+  const lines = [
+    '🪰 **FlyBrain realtime processing**',
+    `**Message:** ${message || '[empty]'}`,
+    `**Neural result:** ${action === 'none' ? 'no mapped motor response above threshold' : ACTIONS[action] || action}`,
+    `**Peak activity:** ${peak.toFixed(4)}`,
+    `**Mean activity:** ${mean.toFixed(4)}`,
+    `**Readout:** ${anatomy}`,
+    '**Source:** FlyWire FAFB v783 + FlyBrain LIF'
+  ];
 
-  let response;
-
-  if (/^(hi|hello|hey|yo|sup|hola)\b/.test(lower)) {
-    response = `Hello, ${message.member?.displayName || message.author.username}. FlyBrain is active.`;
-  } else if (/\b(feed|food|hungry|sugar)\b/.test(lower)) {
-    response = 'Feeding-related stimulus detected and classified.';
-  } else if (/\b(how are you|how r u|how are u)\b/.test(lower)) {
-    response = 'Neural activity is stable.';
-  } else if (/\b(who are you|what are you|what is flybot)\b/.test(lower)) {
-    response = 'I am FlyBot, driven by the FlyWire FAFB v783 connectome through FlyBrain LIF simulation.';
-  } else if (/\b(thanks|thank you|thx)\b/.test(lower)) {
-    response = 'Acknowledged.';
-  } else {
-    response = 'Input classified and passed through the realtime FlyBot processing pipeline.';
+  if (result?.stimulus) {
+    lines.splice(3, 0, `**Stimulus:** ${result.stimulus}`);
   }
 
-  return [
-    '🪰 **Realtime FlyBrain processing**',
-    `**Message:** ${displayText}`,
-    `**Result:** ${response}`,
-    `**Source:** FlyWire FAFB v783 + FlyBrain LIF`
-  ].join('\n');
+  return lines.join('\n');
 }
 
 async function replyToMessage(message) {
@@ -154,10 +193,27 @@ async function replyToMessage(message) {
   lastMessage = new Date().toISOString();
   lastMessageText = text;
 
-  const reply = await message.reply(makeRealtimeReply(message));
+  let result;
+  try {
+    result = await processThroughFlyBrain(text, message.author);
+    lastNeuralResult = result;
+    brainConnected = true;
+    lastBrainHeartbeat = new Date().toISOString();
+    lastBrainError = null;
+  } catch (error) {
+    lastBrainError = error.message;
+    console.error(`[FlyBrain] realtime processing failed: ${error.message}`);
+    await message.reply(
+      `🪰 **FlyBrain realtime processing**\n**Message:** ${text.slice(0, 500)}\n**Status:** processing failed\n**Error:** ${error.message}`
+    );
+    return;
+  }
+
+  const reply = await message.reply(formatBrainReply(text, result));
   messagesSent += 1;
 
   console.log(`[Discord] realtime message processed: ${message.author.tag || message.author.id} -> ${text.slice(0, 300)}`);
+  console.log(`[FlyBrain] result: ${JSON.stringify(result)}`);
   console.log(`[Discord] reply message id: ${reply.id}`);
 }
 
@@ -204,6 +260,7 @@ const server = http.createServer(async (req, res) => {
       lastSignal,
       lastMessage,
       lastMessageText,
+      lastNeuralResult,
       lastBrainError
     }));
     return;
@@ -258,6 +315,7 @@ client.once('ready', async () => {
   console.log(`FlyBot online as ${client.user.tag}`);
   console.log(`Brain gateway listening on :${PORT}`);
   console.log(`Target channel: ${TARGET_CHANNEL_ID}`);
+  console.log(`Realtime FlyBrain endpoint: ${BRAIN_PROCESS_URL}`);
 
   try {
     const channel = await resolveChannel();
