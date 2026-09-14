@@ -1,4 +1,4 @@
-name: FlyBrain Test
+name: FlyBrain + FlyBot Test
 
 on:
   workflow_dispatch:
@@ -9,7 +9,8 @@ on:
       - "package.json"
 
 jobs:
-  test-flybrain:
+  flybrain-test:
+    name: Test FlyBrain Environment
     runs-on: ubuntu-latest
 
     steps:
@@ -20,6 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Clone FlyBrain
         run: |
@@ -27,9 +29,12 @@ jobs:
             https://github.com/Tharusha101/flybrain.git \
             vendor/flybrain
 
-      - name: Install dependencies
+      - name: Upgrade pip
         run: |
           python -m pip install --upgrade pip
+
+      - name: Install scientific dependencies
+        run: |
           python -m pip install \
             numpy \
             pandas \
@@ -40,35 +45,186 @@ jobs:
             seaborn \
             tqdm \
             rich
+
+      - name: Install PyTorch
+        run: |
           python -m pip install torch
 
-      - name: Check packages
+      - name: Show environment
         run: |
-          python --version
-          python -c "import numpy; print('NumPy:', numpy.__version__)"
-          python -c "import pandas; print('Pandas:', pandas.__version__)"
-          python -c "import scipy; print('SciPy:', scipy.__version__)"
-          python -c "import torch; print('PyTorch:', torch.__version__)"
+          echo "======================================"
+          echo " FlyBot / FlyBrain Environment"
+          echo "======================================"
 
-      - name: FlyBrain import
+          echo "Python:"
+          python --version
+
+          echo ""
+          echo "Architecture:"
+          uname -m
+
+          echo ""
+          echo "NumPy:"
+          python -c "import numpy; print(numpy.__version__)"
+
+          echo "Pandas:"
+          python -c "import pandas; print(pandas.__version__)"
+
+          echo "SciPy:"
+          python -c "import scipy; print(scipy.__version__)"
+
+          echo "PyArrow:"
+          python -c "import pyarrow; print(pyarrow.__version__)"
+
+          echo "NetworkX:"
+          python -c "import networkx; print(networkx.__version__)"
+
+          echo "PyTorch:"
+          python -c "import torch; print(torch.__version__)"
+
+          echo "CUDA available:"
+          python -c "import torch; print(torch.cuda.is_available())"
+
+      - name: Test FlyBrain package
         env:
           PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
         run: |
+          echo "Testing FlyBrain..."
+
           python -c "import flybrain; print('FlyBrain import: OK')"
-          python -c "from flybrain.simulator import Simulator; print('Simulator import: OK')"
 
-      - name: Inspect FlyBrain modules
+          python -c \
+            "from flybrain.simulator import Simulator; print('Simulator import: OK')"
+
+      - name: Inspect FlyBrain source
         run: |
-          echo "=== flybrain directory ==="
-          find vendor/flybrain/flybrain -maxdepth 2 -type f | sort
+          echo "======================================"
+          echo " FlyBrain Source Structure"
+          echo "======================================"
 
-          echo ""
-          echo "=== Python classes/modules containing Connectome ==="
-          grep -R "class Connectome\|Connectome" \
-            -n vendor/flybrain/flybrain \
-            --include="*.py" | head -100 || true
+          find vendor/flybrain/flybrain \
+            -maxdepth 2 \
+            -type f \
+            | sort
+
+      - name: Find connectome implementation
+        run: |
+          echo "======================================"
+          echo " Connectome Implementation"
+          echo "======================================"
+
+          grep -RniE \
+            "class Connectome|Connectome|from_connectome|load_connectome" \
+            vendor/flybrain/flybrain \
+            --include="*.py" \
+            | head -200 || true
+
+      - name: Inspect data requirements
+        run: |
+          echo "======================================"
+          echo " Data Requirements"
+          echo "======================================"
+
+          for FILE in \
+            vendor/flybrain/README.md \
+            vendor/flybrain/SIMULATOR_GUIDE.md \
+            vendor/flybrain/README.txt
+          do
+            if [ -f "$FILE" ]; then
+              echo ""
+              echo "----- $FILE -----"
+              grep -niE \
+                "download|connectome|parquet|cache|Codex|data|FlyWire" \
+                "$FILE" \
+                | head -150 || true
+            fi
+          done
+
+      - name: Find connectome data
+        run: |
+          echo "======================================"
+          echo " Existing Connectome Data"
+          echo "======================================"
+
+          FOUND=0
+
+          while IFS= read -r FILE; do
+            echo "$FILE"
+            FOUND=1
+          done < <(
+            find vendor/flybrain \
+              -type f \
+              \( \
+                -iname "*.parquet" \
+                -o -iname "*.npz" \
+                -o -iname "*.npy" \
+                -o -iname "*.csv" \
+              \) \
+              | head -200
+          )
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No connectome dataset found."
+            echo "This is expected: the FlyWire dataset is not bundled."
+          fi
 
       - name: Test FlyBot bridge syntax
+        env:
+          PYTHONPATH: ${{ github.workspace }}/vendor/flybrain
         run: |
+          echo "======================================"
+          echo " FlyBot Bridge"
+          echo "======================================"
+
           python -m py_compile brain/flywire_bridge.py
+
           echo "flywire_bridge.py syntax: OK"
+
+      - name: Inspect FlyBot bridge
+        run: |
+          echo "======================================"
+          echo " Bridge Configuration"
+          echo "======================================"
+
+          grep -nE \
+            "FLYBOT_URL|BRAIN_WEBHOOK_SECRET|FLYBRAIN_PATH|FLYBRAIN_CACHE|FLYBRAIN_DEVICE|WEIGHT_SCALE|STIM_AMP|PULSE_MS" \
+            brain/flywire_bridge.py \
+            | head -100 || true
+
+      - name: Verify project files
+        run: |
+          echo "======================================"
+          echo " FlyBot Project"
+          echo "======================================"
+
+          test -f package.json
+          test -f src/index.js
+          test -f brain/flywire_bridge.py
+
+          echo "package.json: OK"
+          echo "src/index.js: OK"
+          echo "brain/flywire_bridge.py: OK"
+
+      - name: Final report
+        run: |
+          echo ""
+          echo "=============================================="
+          echo "          FLYBOT FLYBRAIN TEST"
+          echo "=============================================="
+          echo ""
+          echo "Python environment       : PASS"
+          echo "Scientific dependencies  : PASS"
+          echo "PyTorch                  : PASS"
+          echo "FlyBrain package         : PASS"
+          echo "FlyBrain simulator       : PASS"
+          echo "FlyBot bridge syntax     : PASS"
+          echo ""
+          echo "Connectome data:"
+          echo "The actual FlyWire dataset is NOT bundled"
+          echo "with the FlyBrain repository."
+          echo ""
+          echo "NEXT:"
+          echo "Connect the actual FlyWire dataset and run"
+          echo "the neural simulation."
+          echo ""
+          echo "=============================================="
